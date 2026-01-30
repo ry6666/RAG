@@ -1,64 +1,127 @@
-# 数据集目录（原始数据和缓存）
-dataset/
+# RAG System Git Ignore
 
-# 知识库目录（包含大量生成的索引文件）
+# Data directories
+data/
+dataset/
 kb/
 
-# 虚拟环境
-.venv/
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Scripts directory
+scripts/
+
+# Output directories
+output/
+logs/
+results/
+
+# Dependencies
 venv/
 env/
-ENV/
-.Env/
-.env/
-.env
-
-# 配置文件（可能包含敏感信息）
-config/
-*.yaml
-*.yml
-!.github/workflows/*.yml
-
-# Python
+*.venv/
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
 
-# IDE
+# IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+
+# OS files
 .DS_Store
+Thumbs.db
 
-# 输出和日志
-output/
-logs/
-*.log
-
-# 测试结果
-test/results/
-test/validation/
-
-# 模型文件
-*.h5
-*.ckpt
+# Model files
+*.pth
 *.pt
+*.ckpt
+
+# FAISS index files
+*.faiss
+*.index
+
+# BM25 files
+*.bm25
+
+# SpaCy files
+*.spacy
+
+# Graph files
+*.graphml
+*.pkl
+
+# Large files
+*.zip
+*.tar.gz
+*.rar
+
+# Test files
+.test*
+
+# Coverage files
+coverage.xml
+.coverage
+
+# Temporary files
+*.tmp
+*.temp
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# Documentation builds
+docs/build/
+docs/source/_build/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Flask
+instance/
+.webassets-cache
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+*.pyc
+*.pyo
+
+# R
+.Rhistory
+.RData
+
+# SAS
+*.sas7bdat
+
+# Stata
+*.dta
+
+# CSV files (if large)
+*.csv
+
+# Parquet files
+*.parquet
+
+# JSON files (if large)
+*.json
+
+# Text files (if large)
+*.txt
