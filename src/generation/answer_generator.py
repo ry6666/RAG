@@ -162,12 +162,162 @@ Answer:'''
                     return line
             first_line = lines[0].strip() if lines else ''
             if first_line:
+                first_line = _postprocess_answer(question, first_line, clues)
                 return first_line
             return _fallback_extract(chunks)
     except Exception as e:
         pass
 
     return _fallback_extract(chunks)
+
+
+def _postprocess_answer(question: str, answer: str, clues: list = None) -> str:
+    """后处理答案：确保数字带单位，Yes/No问题严格输出"""
+    if not answer or not answer.strip():
+        return answer
+
+    answer = answer.strip()
+    question_lower = question.lower().strip()
+
+    is_yes_no_question = (
+        question_lower.startswith('are ') or
+        question_lower.startswith('were ') or
+        question_lower.startswith('do ') or
+        question_lower.startswith('does ') or
+        question_lower.startswith('did ') or
+        question_lower.startswith('can ') or
+        question_lower.startswith('have ') or
+        question_lower.startswith('has ') or
+        question_lower.startswith('is ') or
+        (' or ' in question_lower and ('same' in question_lower or 'both' in question_lower or 'different' in question_lower))
+    )
+
+    if is_yes_no_question:
+        answer_lower = answer.lower()
+
+        if 'yes' in answer_lower and len(answer_lower) < 30:
+            return 'yes'
+        if 'no' in answer_lower and len(answer_lower) < 30:
+            return 'no'
+
+        yes_match = re.search(r'\byes\b', answer_lower)
+        no_match = re.search(r'\bno\b', answer_lower)
+
+        if yes_match and not no_match:
+            return 'yes'
+        if no_match and not yes_match:
+            return 'no'
+
+        if answer_lower.startswith('yes') and len(answer_lower) < 50:
+            return 'yes'
+        if answer_lower.startswith('no') and len(answer_lower) < 50:
+            return 'no'
+
+        if len(answer) > 100 and clues:
+            answer_lower = answer.lower()
+            question_lower = question.lower()
+
+            if 'yes' in answer_lower[:50]:
+                return 'yes'
+            if 'no' in answer_lower[:50]:
+                return 'no'
+
+            if 'same' in question_lower or 'both' in question_lower or 'together' in question_lower:
+                if 'different' in answer_lower and 'not the same' in answer_lower:
+                    return 'no'
+                if 'different level' in answer_lower or 'different type' in answer_lower:
+                    return 'no'
+                if 'same' in answer_lower and 'different' not in answer_lower:
+                    return 'yes'
+                if 'both in' in answer_lower or 'both are' in answer_lower:
+                    both_count = answer_lower.count(' in ') + answer_lower.count(' are ')
+                    if both_count >= 2:
+                        locations = re.findall(r'in\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', answer)
+                        locations_lower = [loc.lower() for loc in locations]
+                        unique_locations = list(set(locations_lower))
+                        if len(unique_locations) >= 2:
+                            return 'no'
+                        if len(unique_locations) == 1:
+                            return 'yes'
+
+            if 'located in' in question_lower or 'located at' in question_lower:
+                locations = re.findall(r'(?:is|are|was|were)\s+in\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', answer_lower)
+                unique_locations = list(set(locations))
+                if len(unique_locations) >= 2:
+                    return 'no'
+                if len(unique_locations) == 1:
+                    return 'yes'
+
+            if 'same level' in question_lower or 'same type' in question_lower:
+                if 'prefecture-level' in answer_lower and 'county-level' in answer_lower:
+                    return 'no'
+                if 'both are' in answer_lower and 'level' in answer_lower:
+                    return 'yes'
+                if 'different level' in answer_lower:
+                    return 'no'
+
+    is_number_question = (
+        'how many' in question_lower or
+        'how much' in question_lower or
+        'population' in question_lower or
+        'seated' in question_lower or
+        'capacity' in question_lower or
+        re.search(r'\d+', answer) is not None
+    )
+
+    if is_number_question and clues:
+        number_pattern = r'([\d,]+(?:\.\d+)?)'
+        number_match = re.search(number_pattern, answer)
+        if number_match:
+            number = number_match.group(1)
+            unit = _extract_unit_from_clues(question, clues)
+            if unit and unit not in answer:
+                return f"{number} {unit}"
+            return number
+
+    return answer
+
+
+def _extract_unit_from_clues(question: str, clues: list) -> str:
+    """从线索中提取数字的单位"""
+    if not clues:
+        return None
+
+    question_lower = question.lower()
+    clues_text = " ".join(clues).lower()
+
+    units = {
+        'seated': ['seated', 'seat', 'seating'],
+        'people': ['people', 'population', 'residents', 'inhabitants'],
+        'meter': ['meter', 'meters', 'm', 'tall', 'height'],
+        'kilometer': ['kilometer', 'kilometers', 'km', 'long', 'distance'],
+        'year': ['year', 'years', 'old', 'age', 'established', 'founded'],
+        'million': ['million', 'million'],
+        'billion': ['billion', 'billion'],
+    }
+
+    for unit_name, keywords in units.items():
+        for keyword in keywords:
+            if keyword in clues_text:
+                return unit_name
+            if keyword in question_lower:
+                return unit_name
+
+    context_units = [
+        (r'seated\s+(\d+[,]?\d*)', 'seated'),
+        (r'(\d+[,]?\d*)\s+people', 'people'),
+        (r'population\s+of\s+(\d+[,]?\d*)', 'people'),
+        (r'(\d+[,]?\d*)\s+meters', 'meters'),
+        (r'(\d+[,]?\d*)\s+kilometers', 'kilometers'),
+        (r'established\s+in\s+(\d{4})', 'year'),
+    ]
+
+    for pattern, unit in context_units:
+        match = re.search(pattern, clues_text)
+        if match:
+            return unit
+
+    return None
 
 
 def _fallback_extract(chunks: list) -> str:
@@ -233,13 +383,37 @@ def generate_answer_with_fallback(question: str, chunks: list, retriever) -> str
         return clues
 
     def extract_answer_from_clues(question: str, clues: list) -> str:
-        """从线索中提取答案（增强版：支持简洁答案提取）"""
+        """从线索中提取答案（增强版：支持简洁答案提取，Yes/No问题特殊处理）"""
         if not clues:
             return None
 
         clues_text = "\n".join(clues)
 
         question_lower = question.lower().strip()
+
+        is_yes_no_question = (
+            question_lower.startswith('are ') or
+            question_lower.startswith('were ') or
+            question_lower.startswith('do ') or
+            question_lower.startswith('does ') or
+            question_lower.startswith('did ') or
+            question_lower.startswith('can ') or
+            question_lower.startswith('have ') or
+            question_lower.startswith('has ') or
+            question_lower.startswith('is ') or
+            (' or ' in question_lower and ('same' in question_lower or 'both' in question_lower))
+        )
+
+        if is_yes_no_question:
+            for line in clues_text.split('\n'):
+                line_lower = line.strip().lower()
+                if line_lower in ['yes', 'no']:
+                    return line_lower
+                if line_lower.startswith('yes') and len(line_lower) < 10:
+                    return 'yes'
+                if line_lower.startswith('no') and len(line_lower) < 10:
+                    return 'no'
+
         is_what_is_question = (
             question_lower.startswith('what ') or
             question_lower.startswith('who ') or
@@ -321,6 +495,7 @@ Answer:'''
     answer = extract_answer_from_clues(question, clues)
 
     if answer and contains_relevant_info(clues, question):
+        answer = _postprocess_answer(question, answer, clues)
         return answer
 
     if not contains_relevant_info(clues, question) and retriever:

@@ -9,6 +9,58 @@ from config.config import (
     MIN_ENTITY_LENGTH, COMPARISON_ENTITY_NUM, BRIDGE_ENTITY_NUM
 )
 
+
+GENERIC_ENTITIES_TO_FILTER = {
+    'italian', 'american', 'british', 'french', 'german', 'spanish', 'chinese', 'japanese', 'korean',
+    'russian', 'indian', 'mexican', 'canadian', 'australian', 'brazilian', 'european', 'asian',
+    'african', 'northern', 'southern', 'eastern', 'western', 'central',
+    'science', 'science fantasy', 'young adult', 'adult', 'fantasy', 'horror', 'comedy', 'drama',
+    'professional', 'national', 'international', 'major', 'minor', 'public', 'private',
+    'new', 'old', 'first', 'last', 'same', 'other', 'such', 'what', 'which', 'who', 'where', 'when', 'how', 'why',
+    'united', 'states', 'kingdom', 'york', 'city', 'county', 'district',
+    'university', 'college', 'school', 'institute', 'academy',
+    'film', 'movie', 'series', 'album', 'song', 'book', 'novel',
+    'team', 'club', 'league', 'association', 'organization',
+    'war', 'battle', 'event', 'festival', 'award', 'prize',
+}
+
+NATIONALITY_PATTERNS = [
+    r'^(Italian|American|British|French|German|Spanish|Chinese|Japanese|Korean|Russian|Indian|Mexican|Canadian|Australian|Brazilian|European|Asian|African)$',
+]
+
+QUESTION_WORD_PATTERNS = [
+    r'^(What|Which|Who|Where|When|Why|How|Is|Are|Was|Were|Do|Does|Did|Has|Have|Had|Can|Could|Would|Should|May|Might|Must|Will|Shall)$',
+]
+
+
+def _is_generic_entity(entity: str) -> bool:
+    """检查是否为通用/非特异性实体"""
+    entity_lower = entity.lower().strip()
+    
+    if entity_lower in GENERIC_ENTITIES_TO_FILTER:
+        return True
+    
+    if len(entity.split()) == 1:
+        if entity[0].isupper() and entity_lower in [
+            'new', 'old', 'first', 'last', 'same', 'other', 'such',
+            'what', 'which', 'who', 'where', 'when', 'how', 'why',
+            'is', 'are', 'was', 'were', 'do', 'does', 'did',
+            'has', 'have', 'had', 'can', 'could', 'would', 'should',
+            'may', 'might', 'must', 'will', 'shall'
+        ]:
+            return True
+    
+    for pattern in NATIONALITY_PATTERNS:
+        if re.match(pattern, entity, re.IGNORECASE):
+            return True
+    
+    for pattern in QUESTION_WORD_PATTERNS:
+        if re.match(pattern, entity, re.IGNORECASE):
+            return True
+    
+    return False
+
+
 class HotpotQARuleProcessor:
     """HotpotQA纯规则处理器：题型判断（桥接/比较）+ 实体提取"""
     def __init__(self):
@@ -66,7 +118,7 @@ class HotpotQARuleProcessor:
             }
 
     def _extract_proper_noun_candidates(self, question: str) -> List[str]:
-        """提取问题中的专有名词短语候选（核心实体来源）"""
+        """提取问题中的专有名词短语候选（核心实体来源）- 增强版：过滤通用实体"""
         candidates = self.proper_noun_phrase_pattern.findall(question)
 
         question_word_set = set(COMPARISON_QUESTION_WORDS) | {
@@ -79,6 +131,9 @@ class HotpotQARuleProcessor:
         for c in candidates:
             if len(c) < 3:
                 continue
+            
+            if _is_generic_entity(c):
+                continue
 
             words = c.split()
             first_word_lower = words[0].lower()
@@ -86,7 +141,7 @@ class HotpotQARuleProcessor:
             if first_word_lower in question_word_set:
                 if len(words) > 1:
                     remaining = ' '.join(words[1:])
-                    if len(remaining) >= 3:
+                    if len(remaining) >= 3 and not _is_generic_entity(remaining):
                         filtered.append(remaining)
                 continue
 
@@ -137,7 +192,7 @@ class HotpotQARuleProcessor:
 
     def extract_comparison_entities(self, question: str) -> List[str]:
         """
-        比较题实体提取：强制返回2个核心实体
+        比较题实体提取：强制返回2个核心实体（增强版：过滤通用实体）
         规则：优先识别"Are X and Y ..."或"Who is older, X or Y"模式 → 兜底提取专有名词候选
         """
         question_clean = question.strip()
@@ -150,7 +205,8 @@ class HotpotQARuleProcessor:
                 entity1 = match.group(1).strip()
                 entity2 = match.group(2).strip()
                 if len(entity1) >= MIN_ENTITY_LENGTH and len(entity2) >= MIN_ENTITY_LENGTH:
-                    return [entity1, entity2]
+                    if not _is_generic_entity(entity1) and not _is_generic_entity(entity2):
+                        return [entity1, entity2]
 
             fallback_pattern = r'^Are\s+(.+?)\s+and\s+(.+?)\s+(?:of|from|both)\s+'
             match2 = re.search(fallback_pattern, question_clean, re.IGNORECASE)
@@ -165,7 +221,8 @@ class HotpotQARuleProcessor:
                 clean2 = ' '.join([w for w in words2 if w.lower() not in stop_words])
 
                 if len(clean1) >= MIN_ENTITY_LENGTH and len(clean2) >= MIN_ENTITY_LENGTH:
-                    return [clean1, clean2]
+                    if not _is_generic_entity(clean1) and not _is_generic_entity(clean2):
+                        return [clean1, clean2]
 
         elif question_lower.startswith('who is') or question_lower.startswith('which is'):
             or_pattern = r'(?:who is|which is)\s+(?:older|younger|bigger|smaller|taller|shorter|earlier|later|better|worse|more|less)\s*,\s*(.+?)\s+or\s+(.+?)\?'
@@ -174,11 +231,33 @@ class HotpotQARuleProcessor:
                 entity1 = match3.group(1).strip()
                 entity2 = match3.group(2).strip()
                 if len(entity1) >= MIN_ENTITY_LENGTH and len(entity2) >= MIN_ENTITY_LENGTH:
-                    return [entity1, entity2]
+                    if not _is_generic_entity(entity1) and not _is_generic_entity(entity2):
+                        return [entity1, entity2]
+        
+        if ' or ' in question_lower:
+            or_pattern = r'which\s+\w+\s+(?:was|were|is|are)\s+(?:from|in)\s+\w+,\s+(.+?)\s+or\s+(.+?)\??$'
+            match4 = re.search(or_pattern, question_clean, re.IGNORECASE)
+            if match4:
+                entity1 = match4.group(1).strip()
+                entity2 = match4.group(2).strip()
+                if len(entity1) >= MIN_ENTITY_LENGTH and len(entity2) >= MIN_ENTITY_LENGTH:
+                    if not _is_generic_entity(entity1) and not _is_generic_entity(entity2):
+                        return [entity1, entity2]
+            
+            who_or_pattern = r'who\s+(?:was|were)\s+\w+\s+(?:from|in)\s+\w+,\s+(.+?)\s+or\s+(.+?)\??$'
+            match5 = re.search(who_or_pattern, question_clean, re.IGNORECASE)
+            if match5:
+                entity1 = match5.group(1).strip()
+                entity2 = match5.group(2).strip()
+                if len(entity1) >= MIN_ENTITY_LENGTH and len(entity2) >= MIN_ENTITY_LENGTH:
+                    if not _is_generic_entity(entity1) and not _is_generic_entity(entity2):
+                        return [entity1, entity2]
 
         proper_candidates = self._extract_proper_noun_candidates(question)
         if len(proper_candidates) >= COMPARISON_ENTITY_NUM:
-            return proper_candidates[:COMPARISON_ENTITY_NUM]
+            filtered = [c for c in proper_candidates[:COMPARISON_ENTITY_NUM] if not _is_generic_entity(c)]
+            if len(filtered) >= COMPARISON_ENTITY_NUM:
+                return filtered
 
         clean_ques = self._clean_question(question)
         ques_tokens = clean_ques.split()
@@ -192,7 +271,7 @@ class HotpotQARuleProcessor:
     def extract_bridge_entities(self, question: str) -> List[str]:
         """
         桥接题实体提取：返回2-3个核心实体/检索锚点
-        规则：专有名词优先 → 关键词补充 → 绝不返回空
+        规则：专有名词优先 → 关键词补充 → 绝不返回空（增强版：过滤通用实体）
         """
         proper_candidates = self._extract_proper_noun_candidates(question)
 
@@ -202,9 +281,10 @@ class HotpotQARuleProcessor:
             if len(proper_candidates) == 1:
                 entity = proper_candidates[0]
                 keywords = self._extract_bridge_keywords(question)
+                filtered_keywords = [k for k in keywords if not _is_generic_entity(k)]
                 if len(entity.split()) >= 2:
                     return [entity]
-                return [entity] + keywords[:1]
+                return [entity] + filtered_keywords[:1] if filtered_keywords else [entity]
 
         clean_ques = self._clean_question(question)
         ques_tokens = clean_ques.split()
@@ -214,13 +294,17 @@ class HotpotQARuleProcessor:
         for i in range(0, len(filtered_tokens), 2):
             if i+1 < len(filtered_tokens):
                 phrase = " ".join(filtered_tokens[i:i+2])
-                if len(phrase) < 50:
+                if len(phrase) < 50 and not _is_generic_entity(phrase):
                     bridge_anchors.append(phrase)
             if len(bridge_anchors) >= BRIDGE_ENTITY_NUM:
                 break
 
         if len(bridge_anchors) >= 2:
             return bridge_anchors[:BRIDGE_ENTITY_NUM]
+        
+        for keyword in proper_candidates:
+            if not _is_generic_entity(keyword) and len(keyword) >= 4:
+                return [keyword]
 
         return [question[:40]] if question else ["unknown entity"]
 

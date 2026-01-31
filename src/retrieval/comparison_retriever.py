@@ -39,21 +39,160 @@ class ComparisonRetriever:
             self.keyword_store = KeywordStore()
 
     def _init_config(self):
-        """初始化配置（比较问题优化版）
+        """初始化配置（优化版：增加检索数量以支持rerank）
         
         核心原则：
-        - 关键词库权重 0.6：实体精准匹配
-        - 向量库权重 0.4：语义关联同维度属性
-        - recall_top_k=30：保障双实体各维度线索覆盖
-        - 添加分数阈值过滤
+        - 初步检索返回更多chunks（80个），给reranker足够的候选
+        - 关键词库权重 0.5：平衡实体匹配和语义检索
+        - 向量库权重 0.5：增强语义匹配能力
+        - 重排序后返回top 15
         """
-        self.keyword_weight = 0.6
-        self.vector_weight = 0.4
-        self.recall_top_k = 30
-        self.final_top_k = 8
+        self.keyword_weight = 0.5
+        self.vector_weight = 0.5
+        self.recall_top_k = 80
+        self.final_top_k = 15
         
-        self.keyword_score_threshold = 0.25
-        self.vector_score_threshold = 0.65
+        self.keyword_score_threshold = 0.1
+        self.vector_score_threshold = 0.4
+
+    def retrieve_with_entities(self, question: str, entities: List[str], dimension: str = "") -> List[Dict]:
+        """使用预提取的实体进行检索（优化版：增加双实体联合检索用于Yes/No问题）
+        
+        Args:
+            question: 问题文本
+            entities: 预提取的实体列表
+            dimension: 对比维度（可选）
+            
+        Returns:
+            检索结果列表
+        """
+        if not entities:
+            extracted = self._extract_entities_with_dimension(question)
+            entities = extracted.get("entities", [])
+            dimension = extracted.get("dimension", "")
+        
+        all_keyword = []
+        all_vector = []
+
+        if len(entities) >= 2:
+            entity_a = entities[0]
+            entity_b = entities[1] if len(entities) > 1 else ""
+
+            combined_search = self._combined_entity_search(entity_a, entity_b)
+            if combined_search:
+                all_keyword.extend(combined_search)
+
+            for entity in entities[:4]:
+                keyword_results = self._keyword_search(question, [entity, dimension], f"{entity}")
+                vector_results = self._vector_search(question, [entity, dimension])
+                all_keyword.extend(keyword_results)
+                all_vector.extend(vector_results)
+        else:
+            all_keyword = self._keyword_search(question, entities, "both")
+            all_vector = self._vector_search(question, entities)
+
+        fused = self._fuse_results(all_keyword, all_vector, dimension)
+        deduped = self._deduplicate(fused)
+        
+        if len(deduped) < 5:
+            direct_results = self._direct_question_search(question)
+            if direct_results:
+                existing_ids = set(r.get("chunk_id") for r in deduped)
+                for r in direct_results:
+                    if r.get("chunk_id") not in existing_ids:
+                        r["is_direct_search"] = True
+                        deduped.append(r)
+        
+        reranked = self._rerank(question, entities, dimension, deduped)
+        
+        return self._format_results(reranked, entities, dimension)
+
+    def _combined_entity_search(self, entity_a: str, entity_b: str) -> List[Dict]:
+        """双实体联合检索 - 专门用于Yes/No问题，需要同时包含两个实体的段落"""
+        if not entity_a or not entity_b:
+            return []
+
+        combined_results = []
+        seen_ids = set()
+
+        keyword_1 = self.keyword_store.search(entity_a, [entity_a, entity_b], top_k=20)
+        for r in keyword_1:
+            core_text = r.get("core_text", "").lower()
+            entity_b_lower = entity_b.lower()
+            if len(entity_b_lower) > 3 and entity_b_lower in core_text:
+                if r.get("chunk_id") not in seen_ids:
+                    seen_ids.add(r.get("chunk_id"))
+                    r["retrieval_type"] = "combined"
+                    r["entity_tag"] = "both_entities"
+                    combined_results.append(r)
+
+        if len(combined_results) < 3:
+            keyword_2 = self.keyword_store.search(entity_b, [entity_a, entity_b], top_k=20)
+            for r in keyword_2:
+                core_text = r.get("core_text", "").lower()
+                entity_a_lower = entity_a.lower()
+                if len(entity_a_lower) > 3 and entity_a_lower in core_text:
+                    if r.get("chunk_id") not in seen_ids:
+                        seen_ids.add(r.get("chunk_id"))
+                        r["retrieval_type"] = "combined"
+                        r["entity_tag"] = "both_entities"
+                        combined_results.append(r)
+
+        if len(combined_results) < 3:
+            vector_results = self.vector_store.search(f"{entity_a} {entity_b}", top_k=30)
+            for r in vector_results:
+                core_text = r.get("core_text", "").lower()
+                if entity_a.lower() in core_text and entity_b.lower() in core_text:
+                    if r.get("chunk_id") not in seen_ids:
+                        seen_ids.add(r.get("chunk_id"))
+                        r["retrieval_type"] = "combined"
+                        r["entity_tag"] = "both_entities"
+                        combined_results.append(r)
+
+        for r in combined_results:
+            if "keyword_score" not in r:
+                r["keyword_score"] = r.get("score", 0.5)
+
+        return combined_results[:10]
+
+    def _direct_question_search(self, question: str) -> List[Dict]:
+        """直接用问题全文进行检索（当实体检索失败时的兜底策略）"""
+        import re
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', question.lower())
+        stop_words = {'what', 'who', 'whom', 'which', 'where', 'when', 'why', 'how',
+                      'were', 'are', 'was', 'is', 'did', 'does', 'do', 'has', 'have',
+                      'had', 'the', 'that', 'this', 'these', 'those', 'and', 'or',
+                      'but', 'for', 'with', 'from', 'into', 'about', 'above', 'same',
+                      'both', 'local', 'h', 'against'}
+        keywords = [w for w in words if w not in stop_words]
+        
+        if not keywords:
+            return []
+        
+        results = []
+        seen_ids = set()
+        
+        for i in range(min(5, len(keywords))):
+            keyword = keywords[i]
+            
+            kw_results = self.keyword_store.search(keyword, [keyword], top_k=10)
+            for r in kw_results:
+                if r.get("chunk_id") not in seen_ids:
+                    seen_ids.add(r.get("chunk_id"))
+                    r["direct_search_term"] = keyword
+                    results.append(r)
+            
+            vec_results = self.vector_store.search(keyword, top_k=10)
+            for r in vec_results:
+                if r.get("chunk_id") not in seen_ids:
+                    seen_ids.add(r.get("chunk_id"))
+                    r["direct_search_term"] = keyword
+                    results.append(r)
+        
+        for r in results:
+            r["retrieval_type"] = "direct"
+        
+        return results
 
     def retrieve(self, question: str) -> List[Dict]:
         """检索比较问题的相关文档（优化版：维度化检索+双实体均衡）
@@ -67,26 +206,7 @@ class ComparisonRetriever:
         entities = extracted.get("entities", [])
         dimension = extracted.get("dimension", "")
         
-        if len(entities) >= 2:
-            entity_a, entity_b = entities[0], entities[1]
-            
-            keyword_a = self._keyword_search(question, [entity_a, dimension], f"{entity_a}")
-            keyword_b = self._keyword_search(question, [entity_b, dimension], f"{entity_b}")
-            
-            vector_a = self._vector_search(question, [entity_a, dimension])
-            vector_b = self._vector_search(question, [entity_b, dimension])
-            
-            all_keyword = keyword_a + keyword_b
-            all_vector = vector_a + vector_b
-        else:
-            all_keyword = self._keyword_search(question, entities, "both")
-            all_vector = self._vector_search(question, entities)
-
-        fused = self._fuse_results(all_keyword, all_vector, dimension)
-        deduped = self._deduplicate(fused)
-        reranked = self._rerank(question, entities, dimension, deduped)
-
-        return self._format_results(reranked, entities, dimension)
+        return self.retrieve_with_entities(question, entities, dimension)
     
     def _extract_entities_with_dimension(self, question: str) -> Dict:
         """提取双实体和对比维度"""

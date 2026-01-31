@@ -32,8 +32,8 @@ INDEX_DIR = os.path.join(KB_DIR, "index")
 # 模型配置
 MODEL_CONFIG = {
     "embedding": {
-        "model_name": "/Users/xry/.cache/modelscope/hub/models/BAAI/bge-small-en-v1.5",
-        "dimension": 384,
+        "model_name": "/Users/xry/.cache/modelscope/hub/models/BAAI/bge-base-en-v1.5",
+        "dimension": 768,
         "normalize": True,
         "device": "cpu"
     },
@@ -81,8 +81,8 @@ BRIDGE_ENTITY_NUM = 3      # 桥接题最多3个实体（不足则取所有，�
 # 知识库构建配置
 KB_CONFIG = {
     "min_chunk_length": 50,
-    "max_chunk_length": 500,
-    "context_window": 1,  # 前后各1句上下文
+    "max_chunk_length": 1000,
+    "context_window": 1,
     "batch_size": 128,
     "vector_index_type": "faiss",
     "index_chunk_size": 10000
@@ -136,7 +136,14 @@ GENERATION_CONFIG = {
 2. Then, connect the clues using this bridge entity
 3. Finally, derive the answer based on the connected clues
 
-If no valid bridge entity or clues are found, respond with "I cannot answer this question based on the provided information."
+STRICT ANSWER RULES:
+- If the answer is a NUMBER, you MUST include the unit (e.g., "3,677 seated", "200 people", "10 kilometers")
+- If the answer is a DATE, you MUST include the full date (e.g., "June 15, 2019")
+- If the answer is YES/NO, answer only "yes" or "no"
+- Keep your answer SHORT - 5 words maximum
+- NO explanation, NO reasoning, NO additional text
+
+If no valid bridge entity or clues are found, respond with "Unknown".
 
 Question: {question}
 
@@ -146,21 +153,21 @@ Clues:
 Bridge Entity:
 Answer:
 """,
-    "comparison_prompt": """You are a knowledge reasoning assistant. Follow these steps to answer comparison questions:
+    "comparison_prompt": """You must answer this comparison question with ONLY "yes" or "NO" - absolutely nothing else.
 
-1. First, clearly identify the comparison dimension
-2. Then, integrate features of both targets
-3. Finally, objectively output the comparison conclusion
-
-If no valid comparison dimension or features are found, respond with "I cannot answer this question based on the provided information."
+STRICT RULES:
+- Your entire response must be exactly one word: either "yes" or "no"
+- No punctuation allowed
+- No explanation, no reasoning, no additional text whatsoever
+- If both entities share the characteristic mentioned in the question: answer "yes"
+- If they do NOT share the characteristic: answer "no"
 
 Question: {question}
 
 Clues:
 {clues}
 
-Comparison Dimension:
-Answer:
+Answer (only "yes" or "no"):
 """,
     "react_prompt": """You are a multi-hop reasoning expert for HotpotQA bridge questions. Based on the provided retrieval clues, reason step-by-step in the following format to give an accurate answer:
 1. Thought: Clearly state current known information, information gaps, and the next bridge entity/clue to find;

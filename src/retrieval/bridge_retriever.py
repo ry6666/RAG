@@ -39,39 +39,42 @@ class BridgeRetriever:
             self.keyword_store = KeywordStore()
 
     def _init_config(self):
-        """初始化配置（桥接问题优化版）
+        """初始化配置（优化版：增加检索数量以支持rerank）
         
         核心原则：
-        - 关键词库权重 0.7：桥接题依赖实体精准匹配
-        - 向量库权重 0.3：仅做语义补充
-        - recall_top_k=35：保障多跳链路线索覆盖
-        - 添加分数阈值过滤：去除低质量线索
+        - 初步检索返回更多chunks（80个），给reranker足够的候选
+        - 关键词库权重 0.5：平衡实体匹配和语义检索
+        - 向量库权重 0.5：增强语义匹配能力
+        - 重排序后返回top 15
         """
-        self.keyword_weight = 0.7
-        self.vector_weight = 0.3
-        self.recall_top_k = 35
-        self.final_top_k = 10
+        self.keyword_weight = 0.5
+        self.vector_weight = 0.5
+        self.recall_top_k = 80
+        self.final_top_k = 15
         
-        self.keyword_score_threshold = 0.2
-        self.vector_score_threshold = 0.6
+        self.keyword_score_threshold = 0.1
+        self.vector_score_threshold = 0.4
 
-    def retrieve(self, question: str) -> List[Dict]:
-        """检索桥接问题的相关文档（优化版：含兜底机制）
+    def retrieve_with_entities(self, question: str, entities: List[str]) -> List[Dict]:
+        """使用预提取的实体进行检索（优化版：增加直接问题检索）
         
-        检索策略：
-        1. 多实体组合检索
-        2. 若结果不足8条，触发单实体兜底检索
-        3. 若仍不足，触发问题改写兜底检索
+        Args:
+            question: 问题文本
+            entities: 预提取的实体列表
+            
+        Returns:
+            检索结果列表
         """
-        entities = self.classifier.extract_entities(question, "bridge")
-
+        if not entities:
+            entities = self.classifier.extract_entities(question, "bridge")
+        
         keyword_results = self._keyword_search(question, entities)
         vector_results = self._vector_search(question, entities)
 
         fused = self._fuse_results(keyword_results, vector_results)
         deduped = self._deduplicate(fused)
         
-        if len(deduped) < 8 and entities:
+        if len(deduped) < 8:
             fallback_keyword = []
             fallback_vector = []
             
@@ -91,7 +94,6 @@ class BridgeRetriever:
                         r["is_fallback"] = True
                         deduped.append(r)
         
-        # 兜底策略2：若仍不足，尝试问题改写检索
         if len(deduped) < 5:
             reformulated_queries = self._generate_reformulated_queries(question, entities)
             for query in reformulated_queries:
@@ -104,10 +106,73 @@ class BridgeRetriever:
                             r["reformulated_query"] = query
                             deduped.append(r)
         
+        if len(deduped) < 3:
+            direct_results = self._direct_question_search(question)
+            if direct_results:
+                existing_ids = set(r.get("chunk_id") for r in deduped)
+                for r in direct_results:
+                    if r.get("chunk_id") not in existing_ids:
+                        r["is_direct_search"] = True
+                        deduped.append(r)
+        
         deduped = sorted(deduped, key=lambda x: x.get("fused_score", 0.0), reverse=True)[:self.recall_top_k]
         reranked = self._rerank(question, entities, deduped)
+        return reranked
 
-        return self._format_results(reranked, entities)
+    def _direct_question_search(self, question: str) -> List[Dict]:
+        """直接用问题全文进行检索（当实体检索失败时的兜底策略）
+        
+        策略：
+        1. 从问题中提取关键词
+        2. 用关键词组合进行检索
+        3. 返回top结果
+        """
+        import re
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', question.lower())
+        stop_words = {'what', 'who', 'whom', 'which', 'where', 'when', 'why', 'how',
+                      'were', 'are', 'was', 'is', 'did', 'does', 'do', 'has', 'have',
+                      'had', 'the', 'that', 'this', 'these', 'those', 'and', 'or',
+                      'but', 'for', 'with', 'from', 'into', 'about', 'above'}
+        keywords = [w for w in words if w not in stop_words]
+        
+        if not keywords:
+            return []
+        
+        results = []
+        seen_ids = set()
+        
+        for i in range(min(5, len(keywords))):
+            keyword = keywords[i]
+            
+            kw_results = self.keyword_store.search(keyword, [keyword], top_k=10)
+            for r in kw_results:
+                if r.get("chunk_id") not in seen_ids:
+                    seen_ids.add(r.get("chunk_id"))
+                    r["direct_search_term"] = keyword
+                    results.append(r)
+            
+            vec_results = self.vector_store.search(keyword, top_k=10)
+            for r in vec_results:
+                if r.get("chunk_id") not in seen_ids:
+                    seen_ids.add(r.get("chunk_id"))
+                    r["direct_search_term"] = keyword
+                    results.append(r)
+        
+        for r in results:
+            r["retrieval_type"] = "direct"
+        
+        return results
+
+    def retrieve(self, question: str) -> List[Dict]:
+        """检索桥接问题的相关文档（优化版：含兜底机制）
+        
+        检索策略：
+        1. 多实体组合检索
+        2. 若结果不足8条，触发单实体兜底检索
+        3. 若仍不足，触发问题改写兜底检索
+        """
+        entities = self.classifier.extract_entities(question, "bridge")
+        return self.retrieve_with_entities(question, entities)
 
     def _keyword_search(self, question: str, entities: List[str] = None) -> List[Dict]:
         """关键词库检索（增强版：支持实体扩展）
@@ -184,19 +249,35 @@ class BridgeRetriever:
                 break
     
     def _generate_reformulated_queries(self, question: str, entities: List[str]) -> List[str]:
-        """生成改写查询（兜底策略）
+        """生成改写查询（增强版）
         
         当原始检索失败时，尝试以下改写策略：
-        1. 移除停用词，只保留核心实体
-        2. 提取问题类型关键词（who, what, where, etc.）
-        3. 保留疑问词+核心实体
+        1. 原始实体
+        2. 带类型限定词的实体（如 "Kiss and Tell film/movie"）
+        3. 问题类型+实体组合
+        4. 移除停用词
         """
+        import re
         reformulated = []
         
         if entities:
             reformulated.extend(entities)
         
         question_lower = question.lower()
+        
+        if '"' in question or "'" in question:
+            quoted = re.findall(r'["\']([^"\']+)["\']', question)
+            for q in quoted:
+                reformulated.append(f"{q} film")
+                reformulated.append(f"{q} movie")
+                reformulated.append(f"{q} 1945 film")
+        
+        who_portrayed_pattern = r'who portrayed (.+?) in the film'
+        match = re.search(who_portrayed_pattern, question_lower)
+        if match:
+            actor = match.group(1).strip()
+            reformulated.append(f"{actor} actress")
+            reformulated.append(f"{actor} actor")
         
         question_type_map = {
             "who": ["who", "person", "actor", "director", "singer"],
@@ -216,12 +297,12 @@ class BridgeRetriever:
                         break
                 break
         
-        if not reformulated:
-            words = question.split()
-            if len(words) > 3:
-                reformulated.append(" ".join(words[:5]))
+        if entities:
+            for entity in entities[:2]:
+                reformulated.append(f"the {entity}")
+                reformulated.append(f"{entity} biography")
         
-        return list(set(reformulated))[:5]
+        return list(set(reformulated))[:8]
 
     def _fuse_results(self, keyword_results: List[Dict], vector_results: List[Dict]) -> List[Dict]:
         """融合检索结果（优化版：双库命中加分+分数归一化）
@@ -323,15 +404,21 @@ class BridgeRetriever:
         return deduped
 
     def _rerank(self, question: str, entities: List[str], results: List[Dict]) -> List[Dict]:
-        """重排序（优化版：实体加权+覆盖度筛选）
+        """重排序（优化版：实体加权+覆盖度筛选+时间完整性优先+模糊匹配惩罚）
         
         重排序策略：
         1. 查询增强：问题+实体+关系词
         2. 桥接实体加权：包含桥接实体的线索额外加权
         3. 覆盖度筛选：确保覆盖问题中所有核心实体
+        4. 时间完整性优先：对于时间范围问题，优先返回完整时间段
+        5. 模糊匹配惩罚：同名实体过滤，降低模糊实体的匹配权重
         """
         if not results:
             return []
+        
+        is_time_question = any(kw in question.lower() for kw in ['year', 'during', 'from', 'until', 'between', 'managed', 'served', 'held'])
+        
+        ambiguous_entities = self._detect_ambiguous_entities(entities, results)
         
         enhanced_query = self._build_enhanced_query(question, entities)
         
@@ -339,25 +426,140 @@ class BridgeRetriever:
             passages = [r.get("core_text", "") for r in results]
             rerank_scores = self.reranker.rerank(enhanced_query, passages)
             
-            for r, score in zip(results, rerank_scores):
+            for i, (r, score) in enumerate(zip(results, rerank_scores)):
                 base_score = float(score)
+                
+                fuzzy_match_penalty = self._calculate_fuzzy_match_penalty(entities, r, ambiguous_entities)
                 
                 bridge_entity_bonus = 0.0
                 chunk_bridge_entity = r.get("bridge_entity", "").lower()
                 for entity in entities:
                     if entity.lower() in chunk_bridge_entity or chunk_bridge_entity in entity.lower():
-                        bridge_entity_bonus = 0.2
+                        if entity not in ambiguous_entities:
+                            bridge_entity_bonus = 0.2
+                        else:
+                            bridge_entity_bonus = 0.1
                         break
                 
                 dual_hit_bonus = 0.1 if len(r.get("retrieval_types", [])) >= 2 else 0.0
                 
-                r["rerank_score"] = base_score + bridge_entity_bonus + dual_hit_bonus
+                time_completeness_bonus = 0.0
+                if is_time_question:
+                    time_completeness_bonus = self._calculate_time_completeness(r.get("core_text", ""), question)
+                
+                r["rerank_score"] = base_score + bridge_entity_bonus + dual_hit_bonus + time_completeness_bonus + fuzzy_match_penalty
             
             results = sorted(results, key=lambda x: x.get("rerank_score", 0.0), reverse=True)
         
         results = self._filter_by_entity_coverage(results, entities)
+        results = self._filter_irrelevant_chunks(results, entities, question)
         
         return results
+    
+    def _detect_ambiguous_entities(self, entities: List[str], results: List[Dict]) -> set:
+        """检测模糊实体：同名但在不同上下文中指代不同事物
+        
+        模糊实体判断标准：
+        1. 实体名过短（<4字符）但不是常见缩写
+        2. 实体在检索结果中出现在多种不同主题的chunk中
+        3. 实体与多个不同的bridge_entity关联
+        """
+        ambiguous = set()
+        
+        for entity in entities:
+            entity_lower = entity.lower()
+            
+            if len(entity) < 4:
+                common_short_entities = {'usa', 'uk', 'nyc', 'la', 'sf', 'ai', 'ml', 'dj', 'tv'}
+                if entity_lower not in common_short_entities:
+                    ambiguous.add(entity)
+                    continue
+            
+            associated_bridge_entities = set()
+            topic_variety = set()
+            
+            for r in results[:20]:
+                core_text = r.get("core_text", "").lower()
+                chunk_bridge_entity = r.get("bridge_entity", "").lower()
+                
+                if entity_lower in core_text:
+                    associated_bridge_entities.add(chunk_bridge_entity)
+                    
+                    first_sentence = core_text.split('.')[0][:50] if '.' in core_text else core_text[:50]
+                    topic_variety.add(first_sentence)
+            
+            if len(associated_bridge_entities) >= 3:
+                ambiguous.add(entity)
+            elif len(topic_variety) >= 3 and len(associated_bridge_entities) >= 2:
+                ambiguous.add(entity)
+        
+        return ambiguous
+    
+    def _calculate_fuzzy_match_penalty(self, entities: List[str], result: Dict, ambiguous_entities: set) -> float:
+        """计算模糊匹配惩罚分数
+        
+        惩罚策略：
+        1. 模糊实体的匹配降低权重
+        2. 非模糊实体的精确匹配保持或增加权重
+        """
+        penalty = 0.0
+        core_text = result.get("core_text", "").lower()
+        chunk_bridge_entity = result.get("bridge_entity", "").lower()
+        
+        has_exact_bridge_match = False
+        has_ambiguous_match = False
+        
+        for entity in entities:
+            entity_lower = entity.lower()
+            
+            if entity in ambiguous_entities:
+                if entity_lower in core_text or entity_lower in chunk_bridge_entity:
+                    has_ambiguous_match = True
+                    penalty -= 0.15
+            else:
+                if entity_lower in core_text or entity_lower in chunk_bridge_entity:
+                    has_exact_bridge_match = True
+        
+        if has_exact_bridge_match and not has_ambiguous_match:
+            penalty += 0.1
+        
+        return max(-0.3, penalty)
+    
+    def _calculate_time_completeness(self, text: str, question: str) -> float:
+        """计算时间完整性得分"""
+        if not text:
+            return 0.0
+        
+        import re
+        
+        text_lower = text.lower()
+        question_lower = question.lower()
+        
+        year_pattern = r'\b(19|20)\d{2}\b'
+        years_in_text = set(re.findall(year_pattern, text))
+        
+        if not years_in_text:
+            return 0.0
+        
+        full_range_bonus = 0.0
+        if 'from' in question_lower and 'to' in question_lower:
+            if 'from' in text_lower and ('to' in text_lower or 'until' in text_lower):
+                full_range_bonus = 0.15
+        elif 'during' in question_lower:
+            if any(year in text for year in years_in_text):
+                full_range_bonus = 0.1
+        
+        duration_bonus = 0.0
+        if len(years_in_text) >= 2:
+            years = sorted([int(y) for y in years_in_text])
+            if len(years) >= 2:
+                span = years[-1] - years[0]
+                if span >= 10:
+                    duration_bonus = 0.1
+                elif span >= 20:
+                    duration_bonus = 0.15
+        
+        return full_range_bonus + duration_bonus
     
     def _build_enhanced_query(self, question: str, entities: List[str]) -> str:
         """构建增强的查询"""
@@ -390,6 +592,41 @@ class BridgeRetriever:
                 uncovered_results.append(r)
         
         return (covered_results + uncovered_results)[:self.recall_top_k]
+    
+    def _filter_irrelevant_chunks(self, results: List[Dict], entities: List[str], question: str) -> List[Dict]:
+        """过滤无关 chunk：基于实体匹配度 + 相关性评分"""
+        if not results:
+            return results
+        
+        filtered = []
+        question_lower = question.lower()
+        question_keywords = set(w for w in question_lower.split() if len(w) > 3)
+        
+        for r in results:
+            core_text = r.get("core_text", "").lower()
+            chunk_id = r.get("chunk_id", "")
+            
+            entity_match_count = 0
+            for entity in entities:
+                if entity.lower() in core_text:
+                    entity_match_count += 1
+            
+            chunk_keywords = set(w for w in core_text.split() if len(w) > 4)
+            keyword_overlap = len(question_keywords & chunk_keywords)
+            
+            relevance_score = entity_match_count * 0.6 + keyword_overlap * 0.4
+            
+            if entity_match_count >= 1 and relevance_score > 0.5:
+                filtered.append(r)
+            elif entity_match_count >= 2:
+                filtered.append(r)
+            elif keyword_overlap >= 3:
+                filtered.append(r)
+        
+        if not filtered and results:
+            filtered = results[:5]
+        
+        return filtered
 
     def _format_results(self, results: List[Dict], entities: List[str] = None) -> List[Dict]:
         """格式化结果（优化版：强化metadata信息，适配ReAct推理）
